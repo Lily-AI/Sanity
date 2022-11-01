@@ -1,10 +1,13 @@
 <template>
   <div id="horizon-table">
     <Table
+      ref="horizon-table"
       :columns="columns"
       :data="tableData"
       :disabled-hover="true"
       :update-show-children="true"
+      show-summary
+      :summary-method="handleSummary"
     >
       <template slot-scope="{ row }" slot="commit">
         <a :href="row.url" target="_blank">
@@ -13,6 +16,25 @@
       </template>
       <template slot-scope="{ row }" slot="branch">
         <a :href="row.branch_url" target="_blank">{{ row.branch }}</a>
+        &nbsp;
+        <template
+          v-if="row.branches.filter((branch) => branch !== row.branch).length"
+        >
+          <Tooltip style="cursor: help">
+            <Icon type="ios-git-branch" />
+            <div slot="content">
+              <p><i>Also on:</i></p>
+              <div
+                :key="branch"
+                v-for="branch in row.branches.filter(
+                  (branch) => branch !== row.branch
+                )"
+              >
+                {{ branch.length > 23 ? `${branch.slice(0, 23)}...` : branch }}
+              </div>
+            </div>
+          </Tooltip>
+        </template>
       </template>
       <template slot-scope="{ row }" slot="repository">
         <a :href="row.repository_url" target="_blank">{{ row.repository }}</a>
@@ -41,29 +63,95 @@
 <script>
 import moment from "moment";
 
+import { EventBus } from "@/helpers/eventBus";
+
+import notifications from "@/mixins/notifications";
 import octokit from "@/mixins/octokit";
 
 export default {
   name: "HorizonTable",
-  mixins: [octokit],
-  props: ["commitsData"],
+  mixins: [notifications, octokit],
+  props: ["commitsData", "engineer"],
+  created() {
+    EventBus.$on("export-horizon", () => {
+      try {
+        this.$refs["horizon-table"].exportCsv({
+          filename: `${process.env.VUE_APP_ORGANISATION}-HORIZON-${
+            this.engineer
+          }-${moment().format("DD-MM-YY")}`,
+          separator: ";",
+          columns: ["date", "commit", "branch", "repository", "details"],
+          data: [
+            {
+              date: "DATE",
+              commit: "COMMIT",
+              branch: "BRANCH",
+              repository: "REPOSITORY",
+              details: "DETAILS",
+            },
+            ...this.tableData.map((entry) => ({
+              date: entry.date,
+              commit: entry.commit,
+              branch: entry.branch,
+              repository: entry.repository,
+              details: `+${entry.stats.additions} -${entry.stats.deletions} in ${entry.files} files`,
+            })),
+          ],
+        });
+      } catch (error) {
+        this.notificationError(
+          "An error occured during exporting table. Please try again."
+        );
+      }
+    });
+  },
   async mounted() {
     const commits = this.commitsData
       .map((repo) =>
-        repo.commits.map((commit) => ({ ...commit, branch: repo.branch, repo: repo.repo }))
+        repo.commits.map((commit) => ({
+          ...commit,
+          branch: repo.branch,
+          repo: repo.repo,
+        }))
       )
       .flat()
+      .filter((commit) => {
+        return moment(
+          moment(commit.commit.author.date).format("YYYY-MM-DD")
+        ).isBetween(
+          moment(this.$parent.selectedDateRange[0]).format("YYYY-MM-DD"),
+          moment(this.$parent.selectedDateRange[1]).format("YYYY-MM-DD"),
+          undefined,
+          "[]"
+        );
+      })
       .map((commit) => {
         return {
           sha: commit.sha,
-          date: moment(new Date(commit.commit.author.date)).format("LLLL"),
+          date: moment(commit.commit.committer.date).format("LLLL"),
           commit: commit.commit.message,
           url: commit.html_url,
           repository: commit.repo,
           repository_url: `https://github.com/${process.env.VUE_APP_ORGANISATION}/${commit.repo}`,
           branch: commit.branch,
-          branch_url: `https://github.com/${process.env.VUE_APP_ORGANISATION}/${commit.repo}/tree/${commit.branch}`
+          branch_url: `https://github.com/${process.env.VUE_APP_ORGANISATION}/${commit.repo}/tree/${commit.branch}`,
         };
+      })
+      .sort((commit) => {
+        return commit.branch === "main" || commit.branch === "master" ? 1 : -1;
+      })
+      .filter((commit, index, commits) => {
+        let commitBranches = commits.filter((c) => c.sha === commit.sha);
+        commitBranches = commitBranches.length
+          ? commitBranches.map((c) => c.branch)
+          : [];
+
+        if (
+          commits.findIndex((commit2) => commit2.sha === commit.sha) === index
+        ) {
+          commit.branches = commitBranches;
+          return true;
+        }
       });
 
     const commitsDetailsPromises = [];
@@ -100,10 +188,11 @@ export default {
           sortMethod(a, b, type) {
             if (type === "asc") {
               return moment(a).unix() - moment(b).unix();
-            } else {
-              return moment(b).unix() - moment(a).unix();
             }
+
+            return moment(b).unix() - moment(a).unix();
           },
+          sortType: 'desc',
         },
         {
           title: "Commit",
@@ -116,6 +205,18 @@ export default {
           key: "branch",
           slot: "branch",
           sortable: true,
+          filters: [
+            ...new Set(this.commitsData.map((entry) => entry.branch)),
+          ].map((branch) => {
+            return {
+              label: branch,
+              value: branch,
+            };
+          }),
+          filterMultiple: true,
+          filterMethod(value, row) {
+            return row.branch === value;
+          },
           width: 250,
         },
         {
@@ -123,6 +224,18 @@ export default {
           key: "repository",
           slot: "repository",
           sortable: true,
+          filters: [
+            ...new Set(this.commitsData.map((entry) => entry.repo)),
+          ].map((repository) => {
+            return {
+              label: repository,
+              value: repository,
+            };
+          }),
+          filterMultiple: true,
+          filterMethod(value, row) {
+            return row.repository === value;
+          },
           width: 250,
         },
         {
@@ -133,6 +246,95 @@ export default {
         },
       ],
     };
+  },
+  methods: {
+    handleSummary({ columns, data }) {
+      const summary = {};
+      columns.forEach((column) => {
+        const key = column.key;
+
+        switch (key) {
+          case "date": {
+            const dates = data
+              .map((commit) => {
+                return {
+                  timestamp: moment(commit.date).unix(),
+                  date: moment(commit.date),
+                };
+              })
+              .sort((a, b) => b.timestamp - a.timestamp);
+
+            const days = Math.ceil(
+              dates[0].date.diff(dates[dates.length - 1].date, "days", true) + 1
+            );
+
+            summary[key] = {
+              key,
+              value: days === 0 || days === 1 ? `1 day` : `${days} days`,
+            };
+            break;
+          }
+          case "commit": {
+            const commits = data.reduce((prev) => prev + 1, 0);
+            summary[key] = {
+              key,
+              value: commits === 1 ? `1 commit` : `${commits} commits`,
+            };
+            break;
+          }
+          case "branch": {
+            const branches = [...new Set(data.map((commit) => commit.branch))]
+              .length;
+            summary[key] = {
+              key,
+              value: branches === 1 ? `1 branch` : `${branches} branches`,
+            };
+            break;
+          }
+          case "repository": {
+            const repositories = [
+              ...new Set(data.map((commit) => commit.repository)),
+            ].length;
+            summary[key] = {
+              key,
+              value:
+                repositories === 1
+                  ? `1 repository`
+                  : `${repositories} repositories`,
+            };
+            break;
+          }
+          case "details": {
+            const details = {
+              files: data
+                .map((commit) => commit.files)
+                .reduce((prev, next) => prev + next, 0),
+              additions: data
+                .map((commit) => commit.stats.additions)
+                .reduce((prev, next) => prev + next, 0),
+              deletions: data
+                .map((commit) => commit.stats.deletions)
+                .reduce((prev, next) => prev + next, 0),
+            };
+            summary[key] = {
+              key,
+              value: `+ ${details.additions} - ${details.deletions} in ${
+                details.files
+              } ${details.files === 1 ? "file" : "files"}`,
+            };
+            break;
+          }
+          default: {
+            summary[key] = {
+              key,
+              value: "-",
+            };
+          }
+        }
+      });
+
+      return summary;
+    },
   },
 };
 </script>
